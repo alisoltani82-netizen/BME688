@@ -1,0 +1,163 @@
+/**
+ * BME688 Environmental Sensor with ESP32-C3 SuperMini (SPI Interface)
+ * 
+ * Wiring (SPI):
+ *   BME688 VCC  -> 3.3V
+ *   BME688 GND  -> GND
+ *   BME688 SCK  -> GPIO4  (SPI Clock)
+ *   BME688 SDI  -> GPIO6  (MOSI - Master Out, Slave In)
+ *   BME688 SDO  -> GPIO5  (MISO - Master In, Slave Out)
+ *   BME688 CS   -> GPIO7  (Chip Select)
+ * 
+ * This sketch reads temperature, humidity, pressure, and gas resistance
+ * from the BME688 sensor using SPI communication.
+ */
+
+#include <Arduino.h>
+#include <SPI.h>
+#include <Adafruit_Sensor.h>
+#include <Adafruit_BME680.h>
+
+// SPI pins for ESP32-C3 SuperMini
+#define BME_SCK   4   // SPI Clock
+#define BME_MOSI  6   // SDI on sensor
+#define BME_MISO  5   // SDO on sensor
+#define BME_CS    7   // Chip Select
+
+// Sea level pressure for altitude calculation (adjust for your location)
+#define SEALEVELPRESSURE_HPA (1013.25)
+
+// Create BME680 instance using software SPI
+Adafruit_BME680 bme(BME_CS, BME_MOSI, BME_MISO, BME_SCK);
+
+bool sensorFound = false;
+unsigned long loopCount = 0;
+
+void setup() {
+    Serial.begin(115200);
+    
+    // Longer delay for USB CDC to stabilize on ESP32-C3
+    delay(3000);
+    
+    // Print multiple times to ensure visibility
+    for (int i = 0; i < 5; i++) {
+        Serial.println();
+    }
+    Serial.println("=================================");
+    Serial.println("BME688 Environmental Sensor Demo");
+    Serial.println("ESP32-C3 SuperMini (SPI Mode)");
+    Serial.println("=================================");
+    Serial.println();
+    Serial.println("Initializing sensor...");
+    Serial.print("SPI Pins - SCK:");
+    Serial.print(BME_SCK);
+    Serial.print(" MOSI:");
+    Serial.print(BME_MOSI);
+    Serial.print(" MISO:");
+    Serial.print(BME_MISO);
+    Serial.print(" CS:");
+    Serial.println(BME_CS);
+
+    // Initialize BME688 over SPI
+    if (!bme.begin()) {
+        Serial.println();
+        Serial.println("ERROR: Could not find BME688 sensor!");
+        Serial.println("Check wiring:");
+        Serial.println("  VCC -> 3.3V");
+        Serial.println("  GND -> GND");
+        Serial.println("  SCK -> GPIO4");
+        Serial.println("  SDI -> GPIO6");
+        Serial.println("  SDO -> GPIO5");
+        Serial.println("  CS  -> GPIO7");
+        Serial.println();
+        Serial.println("Will retry every 5 seconds...");
+        sensorFound = false;
+    } else {
+        sensorFound = true;
+    }
+
+    if (sensorFound) {
+        Serial.println("BME688 sensor found!");
+
+        // Set up oversampling and filter
+        bme.setTemperatureOversampling(BME680_OS_8X);
+        bme.setHumidityOversampling(BME680_OS_2X);
+        bme.setPressureOversampling(BME680_OS_4X);
+        bme.setIIRFilterSize(BME680_FILTER_SIZE_3);
+        bme.setGasHeater(320, 150); // 320°C for 150 ms
+
+        Serial.println("Sensor configured!");
+    }
+    Serial.println();
+}
+
+void loop() {
+    // If sensor not found, try to reinitialize
+    if (!sensorFound) {
+        Serial.println("Retrying sensor connection...");
+        if (bme.begin()) {
+            sensorFound = true;
+            Serial.println("BME688 sensor found!");
+            bme.setTemperatureOversampling(BME680_OS_8X);
+            bme.setHumidityOversampling(BME680_OS_2X);
+            bme.setPressureOversampling(BME680_OS_4X);
+            bme.setIIRFilterSize(BME680_FILTER_SIZE_3);
+            bme.setGasHeater(320, 150);
+        } else {
+            delay(5000);
+            return;
+        }
+    }
+
+    // Tell BME688 to begin measurement
+    unsigned long endTime = bme.beginReading();
+    if (endTime == 0) {
+        Serial.println("Failed to begin reading!");
+        delay(2000);
+        return;
+    }
+
+    // Wait for reading to complete
+    delay(50);
+    
+    if (!bme.endReading()) {
+        Serial.println("Failed to complete reading!");
+        delay(2000);
+        return;
+    }
+
+    Serial.println("--- Sensor Reading ---");
+    
+    // Temperature
+    Serial.print("Temperature: ");
+    Serial.print(bme.temperature);
+    Serial.println(" °C");
+    
+    // Humidity
+    Serial.print("Humidity: ");
+    Serial.print(bme.humidity);
+    Serial.println(" %");
+    
+    // Pressure
+    Serial.print("Pressure: ");
+    Serial.print(bme.pressure / 100.0);
+    Serial.println(" hPa");
+    
+    // Altitude (estimated)
+    Serial.print("Altitude: ");
+    Serial.print(bme.readAltitude(SEALEVELPRESSURE_HPA));
+    Serial.println(" m");
+    
+    // Gas resistance
+    Serial.print("Gas Resistance: ");
+    Serial.print(bme.gas_resistance / 1000.0);
+    Serial.println(" kOhm");
+    
+    loopCount++;
+    Serial.print("[Loop #");
+    Serial.print(loopCount);
+    Serial.println("]");
+    Serial.println();
+    
+    delay(3000); // Read every 3 seconds
+}

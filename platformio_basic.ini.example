@@ -1,0 +1,19 @@
+; Alternative configuration using Adafruit library (simpler, no BSEC)
+; Rename this to platformio.ini to use the basic version
+
+[env:esp32-c3-supermini]
+platform = espressif32
+board = esp32-c3-devkitm-1
+framework = arduino
+
+; I2C pins for ESP32-C3 SuperMini
+build_flags = 
+    -D I2C_SDA=8
+    -D I2C_SCL=9
+
+; Libraries - using Adafruit library (simpler alternative)
+lib_deps = 
+    adafruit/Adafruit BME680 Library@^2.0.4
+    adafruit/Adafruit Unified Sensor@^1.1.14
+
+monitor_speed = 115200

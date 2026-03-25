@@ -1,6 +1,11 @@
 /**
- * BME688 + GC9A01 Round Display with ESP32-C3 SuperMini
- * 
+ * BME688 + BSEC2 Gas Classification + GC9A01 Round Display
+ * ESP32-C3 SuperMini
+ *
+ * Model: FieldAir_HandSanitizer (Bosch pre-trained 2-class classifier)
+ *   GAS_ESTIMATE_1 = Field Air probability [0..1]
+ *   GAS_ESTIMATE_2 = Hand Sanitizer probability [0..1]
+ *
  * Wiring:
  *   BME688 (Software SPI):
  *     VCC  -> 3.3V
@@ -22,10 +27,11 @@
 
 #include <Arduino.h>
 #include <SPI.h>
-#include <Adafruit_Sensor.h>
-#include <Adafruit_BME680.h>
 #include <Adafruit_GFX.h>
 #include <Adafruit_GC9A01A.h>
+#include <bsec2.h>
+#include "bsec_model_config.h"
+#include "model_labels.h"
 
 // BME688 Software SPI pins
 #define BME_SCK   4
@@ -62,404 +68,248 @@
 #define COLOR_RING      0x4208  // Dark gray
 
 // Create instances
-Adafruit_BME680 bme(BME_CS, BME_MOSI, BME_MISO, BME_SCK);
+SPIClass bmeSpi(FSPI);
+Bsec2 bme;
 Adafruit_GC9A01A tft(TFT_CS, TFT_DC, TFT_MOSI, TFT_SCLK, TFT_RST);
 
 bool sensorFound = false;
 bool displayFound = true;
 bool firstDraw = true;  // Track first display update
 
-// Baseline tracking for air quality estimation
-float gasBaseline = 50000.0;
-float humidityBaseline = 40.0;
-bool baselineCalibrated = false;
-unsigned long startTime = 0;
-unsigned long sampleCount = 0;
-float gasSum = 0;
+// BSEC2 classification output values
+float bsecTemp = NAN;
+float bsecHumidity = NAN;
+float bsecPressure = NAN;
+float bsecGasRes = NAN;
+float bsecGasEstimate[4] = {NAN, NAN, NAN, NAN};
+uint8_t bsecAccuracy = 0;
+bool bsecFrameReady = false;
+unsigned long callbackCount = 0;
 
-// Trend tracking (keep last 5 readings for trend detection)
-#define TREND_SAMPLES 5
-float tempHistory[TREND_SAMPLES] = {0};
-float humHistory[TREND_SAMPLES] = {0};
-int iaqHistory[TREND_SAMPLES] = {0};
-int historyIndex = 0;
-bool historyFull = false;
+// ── BSEC state persistence (NVS flash) ─────────────────────
+#include <Preferences.h>
+Preferences prefs;
+#define STATE_SAVE_PERIOD_MS  (360UL * 60UL * 1000UL)  // every 6 hours
+static uint32_t stateUpdateCounter = 0;
 
-// Previous arc end position for partial redraw
-int lastIAQ = -1;
-
-// Calculate IAQ-like score (0-500, lower is better)
-int calculateAirQualityIndex(float gasRes, float humidity) {
-    float humidityFactor = 1.0;
-    if (humidity > 80) {
-        humidityFactor = 0.8;
-    } else if (humidity < 20) {
-        humidityFactor = 0.9;
-    }
-    
-    float ratio = gasBaseline / gasRes;
-    
-    int iaq;
-    if (ratio <= 0.5) {
-        iaq = 0;
-    } else if (ratio <= 1.0) {
-        iaq = (int)((ratio - 0.5) * 100);
-    } else if (ratio <= 2.0) {
-        iaq = 50 + (int)((ratio - 1.0) * 100);
-    } else if (ratio <= 4.0) {
-        iaq = 150 + (int)((ratio - 2.0) * 75);
-    } else {
-        iaq = 300 + (int)((ratio - 4.0) * 50);
-    }
-    
-    iaq = (int)(iaq * humidityFactor);
-    if (iaq < 0) iaq = 0;
-    if (iaq > 500) iaq = 500;
-    
-    return iaq;
-}
-
-// Air quality rating based on IAQ score
-const char* getAirQualityFromIAQ(int iaq) {
-    if (iaq <= 50) return "Excellent";
-    if (iaq <= 100) return "Good";
-    if (iaq <= 150) return "Light";
-    if (iaq <= 200) return "Moderate";
-    if (iaq <= 250) return "Heavy";
-    if (iaq <= 350) return "Severe";
-    return "Extreme";
-}
-
-// Get color based on IAQ
-uint16_t getIAQColor(int iaq) {
-    if (iaq <= 50) return COLOR_IAQ_GOOD;
-    if (iaq <= 100) return 0x9FE0;  // Light green
-    if (iaq <= 150) return COLOR_IAQ_MOD;
-    if (iaq <= 200) return COLOR_IAQ_BAD;
-    return COLOR_IAQ_POOR;
-}
-
-// Estimate CO2 equivalent
-int estimateCO2(float gasRes, float humidity) {
-    float ratio = gasBaseline / gasRes;
-    int co2 = 400 + (int)((ratio - 0.5) * 800);
-    if (co2 < 400) co2 = 400;
-    if (co2 > 5000) co2 = 5000;
-    return co2;
-}
-
-// Calculate trend from history (-1 = falling, 0 = stable, 1 = rising)
-int getTrend(float* history, int currentIndex, bool isFull) {
-    if (!isFull && currentIndex < 2) return 0;
-    
-    int samples = isFull ? TREND_SAMPLES : currentIndex + 1;
-    if (samples < 2) return 0;
-    
-    // Compare average of first half vs second half
-    float firstHalf = 0, secondHalf = 0;
-    int halfPoint = samples / 2;
-    
-    for (int i = 0; i < halfPoint; i++) {
-        int idx = (currentIndex - samples + 1 + i + TREND_SAMPLES) % TREND_SAMPLES;
-        firstHalf += history[idx];
-    }
-    for (int i = halfPoint; i < samples; i++) {
-        int idx = (currentIndex - samples + 1 + i + TREND_SAMPLES) % TREND_SAMPLES;
-        secondHalf += history[idx];
-    }
-    
-    firstHalf /= halfPoint;
-    secondHalf /= (samples - halfPoint);
-    
-    float diff = secondHalf - firstHalf;
-    float threshold = (firstHalf + secondHalf) / 2 * 0.02;  // 2% threshold
-    
-    if (diff > threshold) return 1;   // Rising
-    if (diff < -threshold) return -1; // Falling
-    return 0;  // Stable
-}
-
-int getIAQTrend(int* history, int currentIndex, bool isFull) {
-    float floatHistory[TREND_SAMPLES];
-    for (int i = 0; i < TREND_SAMPLES; i++) {
-        floatHistory[i] = (float)history[i];
-    }
-    return getTrend(floatHistory, currentIndex, isFull);
-}
-
-// Draw trend arrow
-void drawTrendArrow(int16_t x, int16_t y, int trend, uint16_t color) {
-    tft.setTextColor(color, COLOR_BG);
-    tft.setTextSize(1);
-    tft.setCursor(x, y);
-    if (trend > 0) {
-        // Rising arrow (using characters)
-        tft.fillTriangle(x, y+6, x+4, y, x+8, y+6, color);
-    } else if (trend < 0) {
-        // Falling arrow
-        tft.fillTriangle(x, y, x+4, y+6, x+8, y, color);
-    } else {
-        // Stable (dash)
-        tft.fillRect(x, y+2, 8, 3, color);
-    }
-}
-
-// Optimized arc drawing using filled triangles for thickness
-void drawThickArc(int16_t cx, int16_t cy, int16_t outerR, int16_t innerR,
-                  float startAngle, float endAngle, uint16_t color) {
-    if (endAngle <= startAngle) return;
-    
-    float step = 0.08;  // Angle step in radians
-    float prevAngle = startAngle;
-    
-    for (float angle = startAngle + step; angle <= endAngle + 0.001; angle += step) {
-        float a1 = prevAngle;
-        float a2 = (angle > endAngle) ? endAngle : angle;
-        
-        // Calculate 4 corners of the arc segment
-        int16_t x1o = cx + outerR * cos(a1);
-        int16_t y1o = cy + outerR * sin(a1);
-        int16_t x2o = cx + outerR * cos(a2);
-        int16_t y2o = cy + outerR * sin(a2);
-        int16_t x1i = cx + innerR * cos(a1);
-        int16_t y1i = cy + innerR * sin(a1);
-        int16_t x2i = cx + innerR * cos(a2);
-        int16_t y2i = cy + innerR * sin(a2);
-        
-        // Draw two triangles to fill the segment
-        tft.fillTriangle(x1o, y1o, x2o, y2o, x1i, y1i, color);
-        tft.fillTriangle(x2o, y2o, x2i, y2i, x1i, y1i, color);
-        
-        prevAngle = a2;
-    }
-    yield();
-}
-
-// Draw the IAQ gauge arc with color gradient
-void drawIAQGauge(int iaq) {
-    const float START_ANGLE = 2.356;   // 135 degrees (bottom-left)
-    const float END_ANGLE = 7.069;     // 405 degrees (bottom-right, going clockwise)
-    const int16_t OUTER_R = 118;
-    const int16_t INNER_R = 105;
-    
-    // Only redraw if IAQ changed significantly or first time
-    if (lastIAQ >= 0 && abs(iaq - lastIAQ) < 5) return;
-    
-    // Clear previous arc by drawing background
-    if (lastIAQ >= 0) {
-        drawThickArc(CENTER_X, CENTER_Y, OUTER_R, INNER_R, START_ANGLE, END_ANGLE, COLOR_RING);
-    }
-    
-    // Calculate the end angle based on IAQ (0-500 maps to full arc)
-    float iaqRatio = constrain(iaq, 0, 500) / 500.0;
-    float iaqEndAngle = START_ANGLE + iaqRatio * (END_ANGLE - START_ANGLE);
-    
-    // Draw colored segments based on IAQ zones
-    // Excellent (0-50): Green
-    float zone1End = START_ANGLE + 0.1 * (END_ANGLE - START_ANGLE);  // 0-50
-    float zone2End = START_ANGLE + 0.2 * (END_ANGLE - START_ANGLE);  // 50-100
-    float zone3End = START_ANGLE + 0.3 * (END_ANGLE - START_ANGLE);  // 100-150
-    float zone4End = START_ANGLE + 0.4 * (END_ANGLE - START_ANGLE);  // 150-200
-    float zone5End = START_ANGLE + 0.5 * (END_ANGLE - START_ANGLE);  // 200-250
-    
-    // Draw background arc (gray)
-    drawThickArc(CENTER_X, CENTER_Y, OUTER_R, INNER_R, START_ANGLE, END_ANGLE, COLOR_RING);
-    
-    // Draw colored portion up to current IAQ
-    if (iaqEndAngle > START_ANGLE) {
-        // Zone 1: Excellent (Green)
-        if (iaqEndAngle > START_ANGLE) {
-            float end = min(iaqEndAngle, zone1End);
-            drawThickArc(CENTER_X, CENTER_Y, OUTER_R, INNER_R, START_ANGLE, end, COLOR_IAQ_GOOD);
+bool loadBsecState() {
+    prefs.begin("bsec", true);  // read-only
+    size_t len = prefs.getBytesLength("state");
+    if (len == BSEC_MAX_STATE_BLOB_SIZE) {
+        uint8_t state[BSEC_MAX_STATE_BLOB_SIZE];
+        prefs.getBytes("state", state, len);
+        prefs.end();
+        if (bme.setState(state)) {
+            Serial.println("BSEC state loaded from NVS");
+            return true;
         }
-        // Zone 2: Good (Light Green)
-        if (iaqEndAngle > zone1End) {
-            float end = min(iaqEndAngle, zone2End);
-            drawThickArc(CENTER_X, CENTER_Y, OUTER_R, INNER_R, zone1End, end, 0x9FE0);
-        }
-        // Zone 3: Light (Yellow)
-        if (iaqEndAngle > zone2End) {
-            float end = min(iaqEndAngle, zone3End);
-            drawThickArc(CENTER_X, CENTER_Y, OUTER_R, INNER_R, zone2End, end, COLOR_IAQ_MOD);
-        }
-        // Zone 4: Moderate (Orange)
-        if (iaqEndAngle > zone3End) {
-            float end = min(iaqEndAngle, zone4End);
-            drawThickArc(CENTER_X, CENTER_Y, OUTER_R, INNER_R, zone3End, end, COLOR_IAQ_BAD);
-        }
-        // Zone 5+: Poor to Severe (Red)
-        if (iaqEndAngle > zone4End) {
-            drawThickArc(CENTER_X, CENTER_Y, OUTER_R, INNER_R, zone4End, iaqEndAngle, COLOR_IAQ_POOR);
+        Serial.println("BSEC setState failed");
+        return false;
+    }
+    prefs.end();
+    Serial.println("No saved BSEC state found");
+    return true;  // not an error — first boot
+}
+
+bool saveBsecState() {
+    uint8_t state[BSEC_MAX_STATE_BLOB_SIZE];
+    if (!bme.getState(state))
+        return false;
+    prefs.begin("bsec", false);  // read-write
+    prefs.putBytes("state", state, BSEC_MAX_STATE_BLOB_SIZE);
+    prefs.end();
+    Serial.println("BSEC state saved to NVS");
+    return true;
+}
+
+void updateBsecState() {
+    if (!stateUpdateCounter || (stateUpdateCounter * STATE_SAVE_PERIOD_MS) < millis()) {
+        saveBsecState();
+        stateUpdateCounter++;
+    }
+}
+
+void checkBsecStatus(const char* stage) {
+    if (bme.status < BSEC_OK) {
+        Serial.print("BSEC fatal @ ");
+        Serial.print(stage);
+        Serial.print(": ");
+        Serial.println((int)bme.status);
+    } else if (bme.status > BSEC_OK) {
+        Serial.print("BSEC warning @ ");
+        Serial.print(stage);
+        Serial.print(": ");
+        Serial.println((int)bme.status);
+    }
+
+    if (bme.sensor.status < BME68X_OK) {
+        Serial.print("BME68x error @ ");
+        Serial.print(stage);
+        Serial.print(": ");
+        Serial.println(bme.sensor.status);
+    } else if (bme.sensor.status > BME68X_OK) {
+        Serial.print("BME68x warning @ ");
+        Serial.print(stage);
+        Serial.print(": ");
+        Serial.println(bme.sensor.status);
+    }
+}
+
+void newDataCallback(const bme68xData data, const bsecOutputs outputs, Bsec2 bsec) {
+    (void)bsec;
+
+    if (!outputs.nOutputs) return;
+
+    callbackCount++;
+
+    for (uint8_t i = 0; i < outputs.nOutputs; i++) {
+        const bsecData output = outputs.output[i];
+        uint8_t sid = output.sensor_id;
+
+        if (sid == 6 || sid == 14) {          // RAW_TEMPERATURE / HEAT_COMP_TEMPERATURE
+            bsecTemp = output.signal;
+        } else if (sid == 8 || sid == 12) {   // RAW_HUMIDITY / HEAT_COMP_HUMIDITY
+            bsecHumidity = output.signal;
+        } else if (sid == 7) {                // RAW_PRESSURE
+            bsecPressure = output.signal;
+        } else if (sid == 9) {                // RAW_GAS
+            bsecGasRes = output.signal;
+        } else if (sid == 22) {               // GAS_ESTIMATE_1
+            // Only update classification values if accuracy > 0
+            // (acc=0 means BSEC missed gas data due to FIFO timing)
+            if (output.accuracy > 0) {
+                bsecGasEstimate[0] = output.signal;
+                bsecAccuracy = output.accuracy;
+            }
+        } else if (sid == 23) {               // GAS_ESTIMATE_2
+            if (output.accuracy > 0)
+                bsecGasEstimate[1] = output.signal;
+        } else if (sid == 24) {               // GAS_ESTIMATE_3
+            if (output.accuracy > 0)
+                bsecGasEstimate[2] = output.signal;
+        } else if (sid == 25) {               // GAS_ESTIMATE_4
+            if (output.accuracy > 0)
+                bsecGasEstimate[3] = output.signal;
         }
     }
-    
-    // Draw tick marks at zone boundaries
-    for (int i = 0; i <= 5; i++) {
-        float tickAngle = START_ANGLE + (i * 0.1) * (END_ANGLE - START_ANGLE);
-        int16_t x1 = CENTER_X + (OUTER_R + 2) * cos(tickAngle);
-        int16_t y1 = CENTER_Y + (OUTER_R + 2) * sin(tickAngle);
-        int16_t x2 = CENTER_X + (OUTER_R + 6) * cos(tickAngle);
-        int16_t y2 = CENTER_Y + (OUTER_R + 6) * sin(tickAngle);
-        tft.drawLine(x1, y1, x2, y2, COLOR_TEXT);
-    }
-    
-    lastIAQ = iaq;
+
+    bsecFrameReady = true;
+    updateBsecState();
 }
 
 void displayReadings(float temp, float humidity, float pressure, float altitude, float gasRes) {
-    // Update baseline
-    sampleCount++;
-    gasSum += gasRes;
-    unsigned long elapsed = millis() - startTime;
-    
-    if (elapsed < 300000) {
-        gasBaseline = gasSum / sampleCount;
-    } else if (!baselineCalibrated) {
-        baselineCalibrated = true;
-        Serial.println(">>> Baseline calibrated! <<<");
+    // Find top class from BSEC2 classification
+    int topIdx = 0;
+    float topProb = 0.0f;
+    bool hasData = false;
+    for (int i = 0; i < 4; i++) {
+        if (!isnan(bsecGasEstimate[i])) {
+            hasData = true;
+            if (bsecGasEstimate[i] > topProb) {
+                topProb = bsecGasEstimate[i];
+                topIdx = i;
+            }
+        }
     }
-    
-    int iaq = calculateAirQualityIndex(gasRes, humidity);
-    int co2 = estimateCO2(gasRes, humidity);
-    
-    // Update history for trend tracking
-    tempHistory[historyIndex] = temp;
-    humHistory[historyIndex] = humidity;
-    iaqHistory[historyIndex] = iaq;
-    historyIndex = (historyIndex + 1) % TREND_SAMPLES;
-    if (historyIndex == 0) historyFull = true;
-    
-    // Calculate trends
-    int tempTrend = getTrend(tempHistory, (historyIndex - 1 + TREND_SAMPLES) % TREND_SAMPLES, historyFull);
-    int humTrend = getTrend(humHistory, (historyIndex - 1 + TREND_SAMPLES) % TREND_SAMPLES, historyFull);
-    int iaqTrend = getIAQTrend(iaqHistory, (historyIndex - 1 + TREND_SAMPLES) % TREND_SAMPLES, historyFull);
-    
-    // On first draw only, set up the screen
+
+    // Static screen setup on first draw only
     if (firstDraw) {
         tft.fillScreen(COLOR_BG);
-        
-        // Static label at top
+
+        // Header
         tft.setTextColor(COLOR_TEXT, COLOR_BG);
+        tft.setTextSize(2);
+        tft.setCursor(22, 8);
+        tft.print("Gas  Detect");
+        tft.drawFastHLine(20, 30, 200, COLOR_RING);
+
+        // Middle divider
+        tft.drawFastHLine(20, 142, 200, COLOR_RING);
+
+        // Static labels bottom section
+        tft.setTextColor(0x8410, COLOR_BG);
         tft.setTextSize(1);
-        tft.setCursor(CENTER_X - 6, 8);
-        tft.print("IAQ");
-        
-        // Divider line
-        tft.drawFastHLine(35, 135, 170, COLOR_RING);
-        
-        // Static labels for bottom section - reorganized layout
-        tft.setTextColor(0x8410, COLOR_BG);  // Gray labels
-        tft.setTextSize(1);
-        tft.setCursor(40, 142);
-        tft.print("CO2");
-        tft.setCursor(105, 142);
-        tft.print("GAS");
-        tft.setCursor(165, 142);
-        tft.print("ALT");
-        
-        tft.setCursor(40, 185);
-        tft.print("hPa");
-        
+        tft.setCursor(16, 148); tft.print(kModelLabels[0]);
+        tft.setCursor(16, 162); tft.print(kModelLabels[1]);
+        tft.setCursor(16, 176); tft.print(kModelLabels[2]);
+        tft.setCursor(16, 190); tft.print(kModelLabels[3]);
+
         firstDraw = false;
     }
-    
-    // Draw the IAQ arc gauge (only redraws if IAQ changed significantly)
-    drawIAQGauge(iaq);
-    
-    // IAQ Score - big centered number
-    tft.setTextColor(getIAQColor(iaq), COLOR_BG);
+
+    // ── TOP HALF: class name + confidence ──────────────────
+    uint16_t classColor = hasData && topProb >= 0.7f ? COLOR_IAQ_GOOD
+                        : hasData && topProb >= 0.5f ? COLOR_IAQ_MOD
+                        : COLOR_IAQ_BAD;
+
+    // Class name (size 3, ~18px/char, up to ~13 chars)
+    tft.setTextColor(classColor, COLOR_BG);
+    tft.setTextSize(2);
+    tft.setCursor(22, 38);
+    char nameBuf[24];
+    snprintf(nameBuf, sizeof(nameBuf), "%-18s", hasData ? kModelLabels[topIdx] : "Warming up...");
+    tft.print(nameBuf);
+
+    // Confidence % (size 5 = very large)
+    tft.setTextColor(classColor, COLOR_BG);
     tft.setTextSize(5);
-    tft.setCursor(70, 28);
-    char iaqBuf[6];
-    sprintf(iaqBuf, "%3d", iaq);
-    tft.print(iaqBuf);
-    
-    // IAQ trend arrow next to score
-    drawTrendArrow(165, 35, iaqTrend, getIAQColor(iaq));
-    
-    // Air quality text - centered under the number
-    const char* qualityText = getAirQualityFromIAQ(iaq);
-    int textWidth = strlen(qualityText) * 12;  // 12 pixels per char at size 2
-    int textX = CENTER_X - (textWidth / 2);
-    tft.setTextSize(2);
-    tft.setCursor(textX, 68);
-    // Clear area first, then print centered text
-    char qualBuf[12];
-    sprintf(qualBuf, "%-9s", qualityText);
-    tft.setCursor(60, 68);  // Fixed position for clearing
-    tft.print("         ");  // Clear previous text
-    tft.setCursor(textX, 68);
-    tft.print(qualityText);
-    
-    // Temperature with trend arrow
+    tft.setCursor(52, 62);
+    char confBuf[8];
+    snprintf(confBuf, sizeof(confBuf), "%3d%%", hasData ? (int)(topProb * 100.0f) : 0);
+    tft.print(confBuf);
+
+    // Small env values top-right corner
     tft.setTextColor(COLOR_TEMP, COLOR_BG);
-    tft.setTextSize(3);
-    tft.setCursor(28, 95);
-    char tempBuf[8];
-    sprintf(tempBuf, "%5.1f", temp);
-    tft.print(tempBuf);
-    tft.setTextSize(2);
-    tft.print("C");
-    // Temperature trend arrow
-    drawTrendArrow(28, 120, tempTrend, COLOR_TEMP);
-    
-    // Humidity with trend arrow
-    tft.setTextColor(COLOR_HUMIDITY, COLOR_BG);
-    tft.setTextSize(3);
-    tft.setCursor(138, 95);
-    char humBuf[6];
-    sprintf(humBuf, "%3d", (int)humidity);
-    tft.print(humBuf);
-    tft.setTextSize(2);
-    tft.print("%");
-    // Humidity trend arrow
-    drawTrendArrow(200, 120, humTrend, COLOR_HUMIDITY);
-    
-    // CO2 value
-    tft.setTextColor(COLOR_GAS, COLOR_BG);
-    tft.setTextSize(2);
-    tft.setCursor(30, 152);
-    char co2Buf[8];
-    sprintf(co2Buf, "%4d", co2);
-    tft.print(co2Buf);
-    
-    // Gas resistance
-    tft.setTextColor(COLOR_PRESSURE, COLOR_BG);
-    tft.setTextSize(2);
-    tft.setCursor(95, 152);
-    char gasBuf[8];
-    sprintf(gasBuf, "%5.1f", gasRes / 1000.0);
-    tft.print(gasBuf);
-    
-    // Altitude
-    tft.setTextColor(COLOR_TEXT, COLOR_BG);
-    tft.setTextSize(2);
-    tft.setCursor(155, 152);
-    char altBuf[6];
-    sprintf(altBuf, "%4dm", (int)altitude);
-    tft.print(altBuf);
-    
-    // Pressure (new row)
-    tft.setTextColor(COLOR_HUMIDITY, COLOR_BG);
-    tft.setTextSize(2);
-    tft.setCursor(65, 175);
-    char presBuf[10];
-    sprintf(presBuf, "%7.1f", pressure / 100.0);
-    tft.print(presBuf);
-    
-    // Calibration status at very bottom
     tft.setTextSize(1);
-    tft.setCursor(CENTER_X - 45, 200);
-    if (!baselineCalibrated) {
-        unsigned long remaining = (300000 - elapsed) / 1000;
-        char calBuf[20];
-        sprintf(calBuf, "Calibrating %3lus", remaining);
-        tft.setTextColor(COLOR_IAQ_MOD, COLOR_BG);
-        tft.print(calBuf);
-    } else {
-        tft.setTextColor(COLOR_IAQ_GOOD, COLOR_BG);
-        tft.print("  Calibrated    ");
+    tft.setCursor(140, 112);
+    char tbuf[20]; snprintf(tbuf, sizeof(tbuf), "T %5.1fC ", temp);
+    tft.print(tbuf);
+
+    tft.setTextColor(COLOR_HUMIDITY, COLOR_BG);
+    tft.setCursor(140, 124);
+    char hbuf[20]; snprintf(hbuf, sizeof(hbuf), "RH%4.0f%%  ", humidity);
+    tft.print(hbuf);
+
+    tft.setTextColor(COLOR_PRESSURE, COLOR_BG);
+    tft.setCursor(140, 136);
+    char gbuf[20]; snprintf(gbuf, sizeof(gbuf), "G %5.1fk", isnan(gasRes) ? 0.0f : gasRes / 1000.0f);
+    tft.print(gbuf);
+
+    // ── BOTTOM: probability bars ────────────────────────────
+    const uint16_t BAR_COLORS[4] = {COLOR_IAQ_GOOD, 0x07FF, COLOR_IAQ_MOD, COLOR_IAQ_POOR};
+    for (int i = 0; i < 4; i++) {
+        int pct = hasData && !isnan(bsecGasEstimate[i]) ? (int)(bsecGasEstimate[i] * 100.0f) : 0;
+        uint16_t col = (i == topIdx && hasData) ? BAR_COLORS[i] : COLOR_RING;
+        int y = 148 + i * 14;
+
+        // Probability text
+        tft.setTextColor(col, COLOR_BG);
+        tft.setTextSize(1);
+        tft.setCursor(122, y);
+        char pbuf[8]; snprintf(pbuf, sizeof(pbuf), "%3d%%", pct);
+        tft.print(pbuf);
+
+        // Bar (max 88px)
+        int barW = (int)(pct * 0.88f);
+        tft.fillRect(152, y, 88, 7, COLOR_BG);
+        if (barW > 0) tft.fillRect(152, y, barW, 7, col);
     }
+
+    // ── FOOTER: accuracy + scan count ────────────────────────
+    const char* accLabel[] = {"Stabilizing", "Low acc", "Medium acc", "Calibrated!"};
+    uint16_t accCol[] = {COLOR_IAQ_MOD, COLOR_IAQ_BAD, COLOR_IAQ_MOD, COLOR_IAQ_GOOD};
+    uint8_t acc = bsecAccuracy < 4 ? bsecAccuracy : 0;
+    tft.setTextColor(accCol[acc], COLOR_BG);
+    tft.setTextSize(1);
+    tft.setCursor(16, 210);
+    char accBuf[30]; snprintf(accBuf, sizeof(accBuf), "BSEC: %-16s", accLabel[acc]);
+    tft.print(accBuf);
+
+    // Show scan count + uptime
+    tft.setTextColor(COLOR_RING, COLOR_BG);
+    tft.setCursor(16, 222);
+    char scanBuf[30]; snprintf(scanBuf, sizeof(scanBuf), "Scans:%-5lu  %lus  ", callbackCount, millis()/1000);
+    tft.print(scanBuf);
 }
 
 void displayError(const char* msg) {
@@ -517,26 +367,66 @@ void setup() {
     
     displayStartup();
     delay(1000);
-    
-    // Initialize BME688
-    if (!bme.begin()) {
-        Serial.println("BME688 not found! Check wiring.");
-        Serial.println("  SCK  -> GPIO4");
-        Serial.println("  SDI  -> GPIO6");
-        Serial.println("  SDO  -> GPIO5");
-        Serial.println("  CS   -> GPIO7");
-        displayError("BME688 not found!\nCheck SPI wiring.");
+
+    // Initialize BME688 with BSEC2 over SPI
+    bmeSpi.begin(BME_SCK, BME_MISO, BME_MOSI, BME_CS);
+    if (!bme.begin(BME_CS, bmeSpi)) {
+        Serial.println("BME688/BSEC init failed! Check wiring.");
+        checkBsecStatus("begin");
+        displayError("BME688 init failed");
         sensorFound = false;
     } else {
-        Serial.println("BME688 found!");
         sensorFound = true;
-        
-        // Configure sensor
-        bme.setTemperatureOversampling(BME680_OS_8X);
-        bme.setHumidityOversampling(BME680_OS_2X);
-        bme.setPressureOversampling(BME680_OS_4X);
-        bme.setIIRFilterSize(BME680_FILTER_SIZE_3);
-        bme.setGasHeater(320, 150);
+        Serial.println("BME688 + BSEC initialized");
+
+        {
+            // Load the classification model config
+            // (auto-copied from BSEC2 library by copy_bsec_config.py pre-build script)
+            if (!bme.setConfig(bsec_config)) {
+                checkBsecStatus("setConfig");
+                char cfgErr[40];
+                snprintf(cfgErr, sizeof(cfgErr), "setConfig err %d", (int)bme.status);
+                displayError(cfgErr);
+                sensorFound = false;
+            } else {
+
+            // Restore saved BSEC learning state from NVS (if any)
+            loadBsecState();
+
+            // Temperature offset to compensate for sensor self-heating
+            bme.setTemperatureOffset(1.0f);
+
+            bsecSensor sensorList[] = {
+                BSEC_OUTPUT_RAW_TEMPERATURE,
+                BSEC_OUTPUT_RAW_PRESSURE,
+                BSEC_OUTPUT_RAW_HUMIDITY,
+                BSEC_OUTPUT_RAW_GAS,
+                BSEC_OUTPUT_RAW_GAS_INDEX,
+                BSEC_OUTPUT_GAS_ESTIMATE_1,
+                BSEC_OUTPUT_GAS_ESTIMATE_2,
+                BSEC_OUTPUT_GAS_ESTIMATE_3,
+                BSEC_OUTPUT_GAS_ESTIMATE_4
+            };
+
+            if (!bme.updateSubscription(sensorList, ARRAY_LEN(sensorList), BSEC_SAMPLE_RATE_SCAN)) {
+                checkBsecStatus("updateSubscription");
+                char subErr[40];
+                snprintf(subErr, sizeof(subErr), "Subscribe err %d", (int)bme.status);
+                displayError(subErr);
+                sensorFound = false;
+            } else {
+                bme.attachCallback(newDataCallback);
+                Serial.print("BSEC version ");
+                Serial.print(bme.version.major);
+                Serial.print('.');
+                Serial.print(bme.version.minor);
+                Serial.print('.');
+                Serial.print(bme.version.major_bugfix);
+                Serial.print('.');
+                Serial.println(bme.version.minor_bugfix);
+            }
+            } // end setConfig else
+        }
     }
     
     if (sensorFound) {
@@ -548,110 +438,51 @@ void setup() {
         delay(1000);
     }
     
-    // Initialize start time for baseline calibration
-    startTime = millis();
-    
     Serial.println();
 }
 
 void loop() {
-    static int failCount = 0;  // Track consecutive failures
-    static bool firstReading = true;  // First reading needs extra time
-    
     if (!sensorFound) {
-        if (bme.begin()) {
-            sensorFound = true;
-            bme.setTemperatureOversampling(BME680_OS_8X);
-            bme.setHumidityOversampling(BME680_OS_2X);
-            bme.setPressureOversampling(BME680_OS_4X);
-            bme.setIIRFilterSize(BME680_FILTER_SIZE_3);
-            bme.setGasHeater(320, 150);
-            firstReading = true;  // Reset first reading flag
-        } else {
-            delay(5000);
-            return;
+        delay(2000);
+        return;
+    }
+
+    // Critical: call bme.run() as fast as possible to avoid BME688 FIFO overflow
+    // In parallel mode, the 3-field FIFO fills every ~420ms (3 steps × 140ms).
+    // If we don't poll fast enough, heater step data is lost.
+    if (!bme.run()) {
+        checkBsecStatus("run");
+    }
+
+    // Update display and serial output at reduced rate (not on every callback)
+    static unsigned long lastDisplayUpdate = 0;
+    unsigned long now = millis();
+    if (bsecFrameReady && (now - lastDisplayUpdate >= 5000)) {
+        bsecFrameReady = false;
+        lastDisplayUpdate = now;
+
+        float temp = bsecTemp;
+        float humidity = bsecHumidity;
+        float pressure = bsecPressure;
+        float gasRes = bsecGasRes;
+        float altitude = 44330.0f * (1.0f - powf((pressure / 100.0f) / SEALEVELPRESSURE_HPA, 0.1903f));
+
+        displayReadings(temp, humidity, pressure, altitude, gasRes);
+
+        // Immediately catch up on FIFO data that accumulated during display draw
+        bme.run();
+
+        Serial.print("T:"); Serial.print(temp, 1);
+        Serial.print(" H:"); Serial.print(humidity, 0);
+        Serial.print(" G:"); Serial.print(gasRes / 1000.0, 1);
+        Serial.print("k acc:"); Serial.print(bsecAccuracy);
+        for (int i = 0; i < 4; i++) {
+            Serial.print(" P"); Serial.print(i+1); Serial.print("=");
+            Serial.print(isnan(bsecGasEstimate[i]) ? 0.0f : bsecGasEstimate[i] * 100.0f, 1);
         }
+        Serial.println();
+    } else if (bsecFrameReady) {
+        // Clear flag even if we don't display, to avoid stale state
+        bsecFrameReady = false;
     }
-    
-    // Perform reading with retry logic
-    unsigned long endTime = bme.beginReading();
-    if (endTime == 0) {
-        Serial.println("Failed to begin reading!");
-        failCount++;
-        if (failCount > 5) {
-            Serial.println("Too many failures, reinitializing sensor...");
-            sensorFound = false;
-            failCount = 0;
-        }
-        delay(1000);
-        return;
-    }
-    
-    // Wait for the reading to complete
-    // First reading needs extra time for gas heater warmup
-    if (firstReading) {
-        Serial.println("First reading - waiting for sensor warmup...");
-        delay(500);  // Extra warmup time for first reading
-    } else {
-        delay(150);  // Normal wait time (heater duration is 150ms)
-    }
-    
-    if (!bme.endReading()) {
-        Serial.println("Failed to complete reading!");
-        failCount++;
-        if (failCount > 5) {
-            Serial.println("Too many failures, reinitializing sensor...");
-            sensorFound = false;
-            failCount = 0;
-        }
-        delay(1000);
-        return;
-    }
-    
-    // Get readings
-    float temp = bme.temperature;
-    float humidity = bme.humidity;
-    float pressure = bme.pressure;
-    float gasRes = bme.gas_resistance;
-    float altitude = bme.readAltitude(SEALEVELPRESSURE_HPA);
-    
-    // Check for valid readings - but be lenient on gas at startup
-    if (isnan(temp) || isnan(humidity)) {
-        Serial.println("Invalid sensor data (temp/humidity)!");
-        failCount++;
-        delay(1000);
-        return;
-    }
-    
-    // Gas resistance can be 0 on first few readings - skip display but don't fail
-    if (gasRes == 0) {
-        Serial.println("Gas sensor warming up...");
-        delay(1000);
-        return;
-    }
-    
-    // Success! Reset fail counter
-    failCount = 0;
-    firstReading = false;
-    
-    // Update display
-    displayReadings(temp, humidity, pressure, altitude, gasRes);
-    
-    // Calculate IAQ and CO2 for serial output
-    int iaq = calculateAirQualityIndex(gasRes, humidity);
-    int co2 = estimateCO2(gasRes, humidity);
-    
-    // Print to Serial
-    Serial.println("--- Sensor Reading ---");
-    Serial.print("Temperature: "); Serial.print(temp); Serial.println(" C");
-    Serial.print("Humidity: "); Serial.print(humidity); Serial.println(" %");
-    Serial.print("Pressure: "); Serial.print(pressure / 100.0); Serial.println(" hPa");
-    Serial.print("Altitude: "); Serial.print(altitude); Serial.println(" m");
-    Serial.print("Gas Resistance: "); Serial.print(gasRes / 1000.0); Serial.println(" kOhm");
-    Serial.print("IAQ Score: "); Serial.print(iaq); Serial.print(" ("); Serial.print(getAirQualityFromIAQ(iaq)); Serial.println(")");
-    Serial.print("Est. CO2: "); Serial.print(co2); Serial.println(" ppm");
-    Serial.print("Baseline Calibrated: "); Serial.println(baselineCalibrated ? "Yes" : "No");
-    Serial.println();
-    
-    delay(2000);
 }

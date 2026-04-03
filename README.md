@@ -98,6 +98,59 @@ The round display shows:
 - estimated CO2, gas resistance, altitude, and pressure
 - calibration status at the bottom
 
+## Cloud Integration
+
+The firmware posts sensor readings to a Firebase Cloud Function every **1 hour** via HTTPS.
+
+### Payload Fields
+
+Each cloud post includes:
+
+| Field | Type | Source |
+|-------|------|--------|
+| `device_id` | string | config.h |
+| `timestamp` | ISO 8601 | NTP sync (pool.ntp.org) |
+| `temp_c` | float | BME688 |
+| `hum_pct` | float | BME688 |
+| `pressure_hpa` | float | BME688 |
+| `gas_kohm` | float | BME688 (gas resistance ÷ 1000) |
+| `altitude_m` | float | computed from pressure |
+| `iaq` | integer | heuristic air-quality score (0–500) |
+| `co2_ppm` | integer | estimated CO₂ (400–5000 ppm) |
+
+### Configuration
+
+Create a `config.h` file in the project root with:
+
+```cpp
+#define WIFI_SSID "your_ssid"
+#define WIFI_PASS "your_password"
+#define DEVICE_ID "device_name"
+#define DEVICE_KEY "device_secret_key"
+#define FUNCTION_URL "https://YOUR_FUNCTION_ENDPOINT"
+#define FUNCTION_HOST "your-function-host.net"
+```
+
+The `config.h` file is excluded from version control via `.gitignore`.
+
+### Retry Behavior
+
+If a POST fails:
+- Device attempts retry every 30 seconds
+- Retries continue for up to 5 minutes
+- After 5 minutes, returns to normal 1-hour schedule
+
+### Multi-Device Support
+
+The Cloud Function accepts fields from both BME688 and DHT22 sensors. Fields are optional — DHT22 devices omit `altitude_m`, `iaq`, and `co2_ppm`, while BME688 sends all fields. Both sensor types store consistently in the database without conflicts.
+
+### Connectivity
+
+- Wi-Fi: Auto-reconnect enabled, DNS hardened to Cloudflare + Google
+- TLS: Hostname-only HTTPS (IP-first approach requires too many retries)
+- Timeouts: 4–5 seconds per operation to fail fast
+- TX power: `WIFI_POWER_8_5dBm` for stable short-range links
+
 ## Serial Output
 
 Each successful reading prints a block similar to:

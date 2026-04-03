@@ -22,10 +22,18 @@
 
 #include <Arduino.h>
 #include <SPI.h>
+#include <WiFi.h>
+#include <HTTPClient.h>
+#include <WiFiClientSecure.h>
+#include <time.h>
+#include "esp_wifi.h"
+#include "lwip/dns.h"
+#include "lwip/ip_addr.h"
 #include <Adafruit_Sensor.h>
 #include <Adafruit_BME680.h>
 #include <Adafruit_GFX.h>
 #include <Adafruit_GC9A01A.h>
+#include "../config.h"
 
 // BME688 Software SPI pins
 #define BME_SCK   4
@@ -69,6 +77,32 @@ bool sensorFound = false;
 bool displayFound = true;
 bool firstDraw = true;  // Track first display update
 
+// Cloud upload state
+static unsigned long lastPostMs = 0;
+const unsigned long POST_INTERVAL_MS = 3600000UL;  // 1 hour
+static bool timeSynced = false;
+
+// Retry-on-failure state (similar to previous script behavior)
+static bool retryMode = false;
+static unsigned long retryStartMs = 0;
+static unsigned long lastRetryAttemptMs = 0;
+static uint32_t retryCount = 0;
+static float retryTempC = 0.0f;
+static float retryHum = 0.0f;
+static float retryPressureHpa = 0.0f;
+static float retryGasKOhm = 0.0f;
+static float retryAltM = 0.0f;
+static int retryIAQ = 0;
+static int retryCO2 = 0;
+const unsigned long RETRY_INTERVAL_MS = 30000UL;      // 30 seconds
+const unsigned long RETRY_MAX_DURATION_MS = 300000UL; // 5 minutes
+
+// DNS cache for Cloud Function host
+static IPAddress cachedIP;
+static unsigned long cacheTime = 0;
+static bool cacheValid = false;
+const unsigned long CACHE_TTL_MS = 3600000UL;  // 1 hour
+
 // Baseline tracking for air quality estimation
 float gasBaseline = 50000.0;
 float humidityBaseline = 40.0;
@@ -87,6 +121,212 @@ bool historyFull = false;
 
 // Previous arc end position for partial redraw
 int lastIAQ = -1;
+
+String nowISO() {
+    struct tm t;
+    if (getLocalTime(&t)) {
+        char buf[32];
+        strftime(buf, sizeof(buf), "%Y-%m-%dT%H:%M:%S%z", &t);
+        return String(buf);
+    }
+    return "t+" + String(millis() / 1000) + "s";
+}
+
+static bool waitForWiFi(uint32_t ms = 20000) {
+    uint32_t t0 = millis();
+    while (WiFi.status() != WL_CONNECTED && (millis() - t0) < ms) {
+        delay(250);
+    }
+    return WiFi.status() == WL_CONNECTED;
+}
+
+static void forceDNS(const char* primary = "1.1.1.1", const char* secondary = "8.8.8.8") {
+    ip_addr_t d1;
+    ip_addr_t d2;
+    ipaddr_aton(primary, &d1);
+    ipaddr_aton(secondary, &d2);
+    dns_setserver(0, &d1);
+    dns_setserver(1, &d2);
+}
+
+static void printWifiInfo() {
+    Serial.printf("[WiFi] IP:%s  GW:%s  DNS:%s\n",
+        WiFi.localIP().toString().c_str(),
+        WiFi.gatewayIP().toString().c_str(),
+        WiFi.dnsIP().toString().c_str());
+
+    wifi_ap_record_t ap;
+    if (esp_wifi_sta_get_ap_info(&ap) == ESP_OK) {
+        Serial.printf("[WiFi] RSSI:%d dBm  ch:%d\n", ap.rssi, ap.primary);
+    }
+}
+
+static void onWiFiEvent(WiFiEvent_t event) {
+    if (event == ARDUINO_EVENT_WIFI_STA_DISCONNECTED) {
+        Serial.println("[WiFi] disconnected - retrying");
+        WiFi.reconnect();
+    } else if (event == ARDUINO_EVENT_WIFI_STA_GOT_IP) {
+        Serial.println("[WiFi] connected");
+        forceDNS("1.1.1.1", "8.8.8.8");
+        printWifiInfo();
+    }
+}
+
+static bool wifiBeginClean(const char* ssid, const char* pass, const char* hostname = "Voc-1") {
+    WiFi.mode(WIFI_STA);
+    WiFi.setSleep(false);
+    WiFi.setTxPower(WIFI_POWER_8_5dBm);
+    WiFi.setAutoReconnect(true);
+    WiFi.persistent(false);
+    WiFi.onEvent(onWiFiEvent);
+    WiFi.setHostname(hostname);
+    forceDNS("1.1.1.1", "8.8.8.8");
+
+    Serial.printf("[WiFi] connect to '%s'...\n", ssid);
+    WiFi.begin(ssid, pass);
+
+    if (!waitForWiFi(20000)) {
+        Serial.println("[WiFi] FAIL (no link)");
+        return false;
+    }
+
+    forceDNS("1.1.1.1", "8.8.8.8");
+    printWifiInfo();
+    return true;
+}
+
+static bool syncClockCT(uint32_t timeoutMs = 30000) {
+    const long gmtOffset_sec = -6 * 3600;
+    const int daylightOffset_sec = 3600;
+    configTime(gmtOffset_sec, daylightOffset_sec, "pool.ntp.org");
+
+    Serial.print("Syncing time");
+    time_t now = time(nullptr);
+    unsigned long t0 = millis();
+    while (now < 8 * 3600 * 2 && (millis() - t0) < timeoutMs) {
+        Serial.print(".");
+        delay(500);
+        now = time(nullptr);
+    }
+
+    if (now >= 8 * 3600 * 2) {
+        Serial.println("\nTime synced");
+        return true;
+    }
+
+    Serial.println("\nTime sync skipped");
+    return false;
+}
+
+static bool reconnectWiFiHard(uint32_t waitMs = 8000) {
+    Serial.println("[WiFi] hard reconnect...");
+    WiFi.disconnect(true, false);
+    delay(200);
+    WiFi.mode(WIFI_STA);
+    WiFi.begin(WIFI_SSID, WIFI_PASS);
+    bool ok = waitForWiFi(waitMs);
+    if (ok) {
+        forceDNS("1.1.1.1", "8.8.8.8");
+        printWifiInfo();
+    }
+    return ok;
+}
+
+static bool postReading(float tempC, float hum, float pressureHpa, float gasKOhm,
+                        float altM, int iaqVal, int co2Val) {
+    if (WiFi.status() != WL_CONNECTED) {
+        Serial.println("[POST] Wi-Fi not connected, attempting reconnect...");
+        WiFi.disconnect(false, false);
+        WiFi.begin(WIFI_SSID, WIFI_PASS);
+        if (!waitForWiFi(8000)) {
+            Serial.println("[POST] reconnect failed");
+            return false;
+        }
+        Serial.printf("[POST] reconnected, IP=%s\n", WiFi.localIP().toString().c_str());
+    }
+
+    IPAddress hostIP;
+    unsigned long nowMs = millis();
+    if (!cacheValid || (nowMs - cacheTime > CACHE_TTL_MS)) {
+        if (!WiFi.hostByName(FUNCTION_HOST, hostIP)) {
+            Serial.println("[POST] DNS lookup failed");
+            return false;
+        }
+        cachedIP = hostIP;
+        cacheTime = nowMs;
+        cacheValid = true;
+    } else {
+        hostIP = cachedIP;
+    }
+    Serial.printf("[POST] host %s -> %s\n", FUNCTION_HOST, hostIP.toString().c_str());
+
+    WiFiClientSecure client;
+    client.setInsecure();
+    client.setTimeout(5000);
+
+    HTTPClient http;
+    http.setConnectTimeout(4000);
+    http.setTimeout(4000);
+    http.setReuse(false);
+
+    String ts = nowISO();
+    String json = "{";
+    json += "\"device_id\":\"" + String(DEVICE_ID) + "\",";
+    json += "\"timestamp\":\"" + ts + "\",";
+    json += "\"temp_c\":" + String(tempC, 1) + ",";
+    json += "\"hum_pct\":" + String(hum, 0) + ",";
+    json += "\"pressure_hpa\":" + String(pressureHpa, 1) + ",";
+    json += "\"gas_kohm\":" + String(gasKOhm, 1) + ",";
+    json += "\"altitude_m\":" + String(altM, 1) + ",";
+    json += "\"iaq\":" + String(iaqVal) + ",";
+    json += "\"co2_ppm\":" + String(co2Val);
+    json += "}";
+
+    // Use hostname endpoint directly. IP-first TLS is unreliable on some networks/cores.
+    if (http.begin(client, FUNCTION_URL)) {
+        http.addHeader("Content-Type", "application/json");
+        http.addHeader("X-Device-Key", DEVICE_KEY);
+        http.addHeader("Connection", "close");
+
+        int code = http.POST(json);
+        String resp = http.getString();
+        http.end();
+
+        if (code < 0) {
+            Serial.printf("[POST] host attempt-1 transport error code=%d\n", code);
+            if (reconnectWiFiHard(8000)) {
+                WiFiClientSecure client2;
+                client2.setInsecure();
+                client2.setTimeout(5000);
+
+                HTTPClient http2;
+                http2.setConnectTimeout(4000);
+                http2.setTimeout(4000);
+                http2.setReuse(false);
+
+                if (http2.begin(client2, FUNCTION_URL)) {
+                    http2.addHeader("Content-Type", "application/json");
+                    http2.addHeader("X-Device-Key", DEVICE_KEY);
+                    http2.addHeader("Connection", "close");
+                    code = http2.POST(json);
+                    resp = http2.getString();
+                    http2.end();
+                    Serial.printf("[POST] host attempt-2 code=%d\n", code);
+                }
+            }
+        }
+
+        if (code >= 200 && code < 300) {
+            Serial.printf("[POST] OK(host): %s\n", resp.c_str());
+            return true;
+        }
+        Serial.printf("[POST] host failed, code=%d body=%s\n", code, resp.c_str());
+    } else {
+        Serial.println("[POST] host begin() failed");
+    }
+
+    return false;
+}
 
 // Calculate IAQ-like score (0-500, lower is better)
 int calculateAirQualityIndex(float gasRes, float humidity) {
@@ -550,6 +790,11 @@ void setup() {
     
     // Initialize start time for baseline calibration
     startTime = millis();
+
+    // Start Wi-Fi and sync clock before cloud upload timestamps are sent.
+    if (wifiBeginClean(WIFI_SSID, WIFI_PASS, "Voc-1")) {
+        timeSynced = syncClockCT(30000);
+    }
     
     Serial.println();
 }
@@ -636,10 +881,72 @@ void loop() {
     
     // Update display
     displayReadings(temp, humidity, pressure, altitude, gasRes);
-    
-    // Calculate IAQ and CO2 for serial output
+
+    // Calculate IAQ and CO2 (used for cloud post and serial output)
     int iaq = calculateAirQualityIndex(gasRes, humidity);
     int co2 = estimateCO2(gasRes, humidity);
+
+    // Push readings to cloud without affecting LCD update flow.
+    if (retryMode) {
+        if (millis() - retryStartMs >= RETRY_MAX_DURATION_MS) {
+            Serial.println("[RETRY] timeout reached, returning to normal schedule");
+            retryMode = false;
+            retryCount = 0;
+            lastPostMs = millis();
+        } else if (millis() - lastRetryAttemptMs >= RETRY_INTERVAL_MS) {
+            retryCount++;
+            lastRetryAttemptMs = millis();
+            Serial.printf("[RETRY] attempt #%u\n", retryCount);
+
+            if (!timeSynced && WiFi.status() == WL_CONNECTED) {
+                timeSynced = syncClockCT(10000);
+            }
+
+            if (!timeSynced) {
+                Serial.println("[RETRY] skipped: time not synced yet");
+            } else {
+                const bool posted = postReading(retryTempC, retryHum, retryPressureHpa, retryGasKOhm, retryAltM, retryIAQ, retryCO2);
+                if (posted) {
+                    Serial.println("[RETRY] success, back to normal schedule");
+                    retryMode = false;
+                    retryCount = 0;
+                    lastPostMs = millis();
+                } else {
+                    Serial.println("[RETRY] failed");
+                }
+            }
+        }
+    } else if (millis() - lastPostMs >= POST_INTERVAL_MS) {
+        if (!timeSynced && WiFi.status() == WL_CONNECTED) {
+            timeSynced = syncClockCT(10000);
+        }
+
+        if (!timeSynced) {
+            Serial.println("[POST] skipped: time not synced yet");
+            lastPostMs = millis();
+        } else {
+            const float pressureHpa = pressure / 100.0f;
+            const float gasKOhm = gasRes / 1000.0f;
+            const bool posted = postReading(temp, humidity, pressureHpa, gasKOhm, altitude, iaq, co2);
+            Serial.println(posted ? "[POST] success" : "[POST] failed");
+            lastPostMs = millis();
+
+            if (!posted) {
+                retryMode = true;
+                retryStartMs = millis();
+                lastRetryAttemptMs = millis();
+                retryCount = 0;
+                retryTempC = temp;
+                retryHum = humidity;
+                retryPressureHpa = pressureHpa;
+                retryGasKOhm = gasKOhm;
+                                retryAltM = altitude;
+                                retryIAQ = iaq;
+                                retryCO2 = co2;
+                Serial.println("[POST] entering retry mode (30s for up to 5min)");
+            }
+        }
+    }
     
     // Print to Serial
     Serial.println("--- Sensor Reading ---");

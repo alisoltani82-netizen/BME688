@@ -121,6 +121,7 @@ bool historyFull = false;
 
 // Previous arc end position for partial redraw
 int lastIAQ = -1;
+const int IAQ_REDRAW_DELTA = 2;
 
 String nowISO() {
     struct tm t;
@@ -482,8 +483,8 @@ void drawIAQGauge(int iaq) {
     const int16_t OUTER_R = 118;
     const int16_t INNER_R = 105;
     
-    // Only redraw if IAQ changed significantly or first time
-    if (lastIAQ >= 0 && abs(iaq - lastIAQ) < 5) return;
+    // Redraw on small changes so the gauge does not appear frozen.
+    if (lastIAQ >= 0 && abs(iaq - lastIAQ) < IAQ_REDRAW_DELTA) return;
     
     // Clear previous arc by drawing background
     if (lastIAQ >= 0) {
@@ -557,6 +558,11 @@ void displayReadings(float temp, float humidity, float pressure, float altitude,
     } else if (!baselineCalibrated) {
         baselineCalibrated = true;
         Serial.println(">>> Baseline calibrated! <<<");
+    } else {
+        // Keep the baseline slowly adapting so IAQ/CO2 continue to respond
+        // to long-term room changes instead of flattening after warmup.
+        const float adaptiveFactor = 0.002f;
+        gasBaseline = (gasBaseline * (1.0f - adaptiveFactor)) + (gasRes * adaptiveFactor);
     }
     
     int iaq = calculateAirQualityIndex(gasRes, humidity);
